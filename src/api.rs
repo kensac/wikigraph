@@ -33,6 +33,9 @@ pub struct App {
     skeleton: std::sync::OnceLock<Vec<(u32, u32)>>,
     /// Per-community stats for semantic zoom, built lazily from the atlas.
     communities: std::sync::OnceLock<Vec<CommunityInfo>>,
+    /// Bounds concurrent expensive work (BFS, DAGs, meshes) so bursts queue
+    /// instead of piling up blocking threads.
+    heavy: tokio::sync::Semaphore,
     rng: AtomicU64,
 }
 
@@ -92,6 +95,7 @@ impl App {
             top_rank_pool,
             skeleton: std::sync::OnceLock::new(),
             communities: std::sync::OnceLock::new(),
+            heavy: tokio::sync::Semaphore::new(6),
             rng: AtomicU64::new(seed),
         })
     }
@@ -139,6 +143,14 @@ impl App {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
+    /// Queue expensive work behind the shared semaphore.
+    async fn heavy_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, (StatusCode, Json<Value>)> {
+        self.heavy
+            .acquire()
+            .await
+            .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "shutting down"))
+    }
+
     fn check(&self, v: u32) -> Result<u32, (StatusCode, Json<Value>)> {
         if (v as usize) < self.g.node_count() {
             Ok(v)
@@ -148,12 +160,34 @@ impl App {
     }
 }
 
+/// WIKIGRAPH_ORIGINS: comma-separated origin allowlist; unset = permissive
+/// (local dev). Restricting origins gates browsers to the portfolio site.
+fn cors_layer() -> CorsLayer {
+    match std::env::var("WIKIGRAPH_ORIGINS") {
+        Ok(list) if !list.trim().is_empty() => {
+            let origins: Vec<axum::http::HeaderValue> = list
+                .split(',')
+                .filter_map(|o| o.trim().parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods([axum::http::Method::GET])
+        }
+        _ => CorsLayer::permissive(),
+    }
+}
+
 fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
     (code, Json(json!({ "error": msg })))
 }
 
 pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
+    let (metric_layer, metric_handle) = axum_prometheus::PrometheusMetricLayer::pair();
     let mut router = Router::new();
+    router = router.route(
+        "/metrics",
+        get(move || std::future::ready(metric_handle.render())),
+    );
     if let Some(dir) = tiles_dir {
         router = router.nest_service("/tiles", tower_http::services::ServeDir::new(dir));
     }
@@ -181,8 +215,36 @@ pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
         .route("/paths", get(paths))
         .route("/random", get(random))
         .route("/top", get(top))
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
+        .layer(metric_layer)
+        .layer(axum::middleware::from_fn(log_request))
+        .layer(tower_http::compression::CompressionLayer::new())
+        // everything is immutable between data snapshots; let browsers and the
+        // CDN cache anything that doesn't set its own policy
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("public, max-age=3600"),
+        ))
         .with_state(app)
+}
+
+/// One structured line per request; docker json logs -> promtail -> loki.
+async fn log_request(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let start = std::time::Instant::now();
+    let res = next.run(req).await;
+    tracing::info!(
+        target: "request",
+        %method,
+        path,
+        status = res.status().as_u16(),
+        ms = start.elapsed().as_millis() as u64,
+    );
+    res
 }
 
 async fn stats(State(app): State<Arc<App>>) -> Json<Value> {
@@ -203,8 +265,10 @@ fn default_limit() -> usize {
     10
 }
 
-/// Titles are stored in underscore form with an uppercase first letter;
-/// normalize the query the same way, trying the exact form first.
+/// Titles are stored in underscore form. Tiers: prefix match on the query and
+/// its capitalization variants (first-letter and per-word — "albert einstein"
+/// must find Albert_Einstein), then a parallel substring scan as a fallback.
+/// Exact title matches are always pinned first.
 async fn search(
     State(app): State<Arc<App>>,
     Query(p): Query<SearchParams>,
@@ -214,22 +278,111 @@ async fn search(
         return Err(err(StatusCode::BAD_REQUEST, "empty query"));
     }
     let limit = p.limit.min(50);
-    let mut candidates = prefix_candidates(&app.g, q.as_bytes());
-    if candidates.is_empty() {
-        let mut chars = q.chars();
-        let upper: String = chars.next().unwrap().to_uppercase().chain(chars).collect();
-        candidates = prefix_candidates(&app.g, upper.as_bytes());
-    }
-    candidates.sort_by(|a, b| app.g.rank(*b).total_cmp(&app.g.rank(*a)));
-    candidates.truncate(limit);
-    let items: Vec<Node> = candidates.into_iter().map(|v| app.node(v)).collect();
+    let app2 = app.clone();
+    let candidates = tokio::task::spawn_blocking(move || {
+        let g = &app2.g;
+        let mut variants = vec![q.clone(), first_upper(&q), title_case(&q)];
+        variants.dedup();
+        let mut candidates: Vec<u32> = Vec::new();
+        for v in &variants {
+            let range = g.prefix_range(v.as_bytes());
+            let end = range.end.min(range.start + MAX_SEARCH_SCAN as u32);
+            candidates.extend(range.start..end);
+        }
+        // substring supplements thin prefix results ("einstein" must also
+        // surface Albert_Einstein); fuzzy is the last tier for typos
+        if candidates.len() < limit && q.len() >= 4 {
+            candidates.extend(substring_scan(g, &q));
+        }
+        if candidates.is_empty() && (4..=40).contains(&q.len()) {
+            candidates = fuzzy_scan(g, &q);
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.sort_by(|a, b| g.rank(*b).total_cmp(&g.rank(*a)));
+        // exact matches (any variant) pinned first
+        let mut pinned: Vec<u32> = variants
+            .iter()
+            .filter_map(|v| g.find(v.as_bytes()))
+            .collect();
+        pinned.dedup();
+        candidates.retain(|v| !pinned.contains(v));
+        pinned.extend(candidates);
+        pinned
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "search failed"))?;
+    let items: Vec<Node> = candidates
+        .into_iter()
+        .take(limit)
+        .map(|v| app.node(v))
+        .collect();
     Ok(Json(json!({ "items": items })))
 }
 
-fn prefix_candidates(g: &Graph, prefix: &[u8]) -> Vec<u32> {
-    let range = g.prefix_range(prefix);
-    let end = range.end.min(range.start + MAX_SEARCH_SCAN as u32);
-    (range.start..end).collect()
+fn first_upper(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Capitalize the first letter of every underscore-separated word.
+fn title_case(s: &str) -> String {
+    s.split('_').map(first_upper).collect::<Vec<_>>().join("_")
+}
+
+/// Bounded edit-distance scan (<= 2 edits, ASCII case-insensitive): typo
+/// tolerance when every other tier came up empty.
+fn fuzzy_scan(g: &Graph, needle: &str) -> Vec<u32> {
+    use rayon::prelude::*;
+    let needle = needle.to_ascii_lowercase();
+    let nb = needle.as_bytes();
+    (0..g.node_count() as u32)
+        .into_par_iter()
+        .filter(|&v| {
+            let t = g.title_bytes(v);
+            t.len().abs_diff(nb.len()) <= 2 && edit_within_2(t, nb)
+        })
+        .collect()
+}
+
+/// Banded Levenshtein, ASCII case-insensitive, early-out above 2.
+fn edit_within_2(a: &[u8], b: &[u8]) -> bool {
+    let (m, n) = (a.len(), b.len());
+    let mut prev: Vec<u16> = (0..=n as u16).collect();
+    let mut cur = vec![0u16; n + 1];
+    for i in 1..=m {
+        cur[0] = i as u16;
+        let mut row_min = cur[0];
+        for j in 1..=n {
+            let cost = u16::from(!a[i - 1].eq_ignore_ascii_case(&b[j - 1]));
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            row_min = row_min.min(cur[j]);
+        }
+        if row_min > 2 {
+            return false;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[n] <= 2
+}
+
+/// Case-insensitive (ASCII) substring scan over every title, in parallel.
+fn substring_scan(g: &Graph, needle: &str) -> Vec<u32> {
+    use rayon::prelude::*;
+    let needle = needle.as_bytes();
+    let mut hits: Vec<u32> = (0..g.node_count() as u32)
+        .into_par_iter()
+        .filter(|&v| {
+            let t = g.title_bytes(v);
+            t.len() >= needle.len()
+                && t.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+        })
+        .collect();
+    hits.truncate(MAX_SEARCH_SCAN);
+    hits
 }
 
 async fn node(
@@ -422,6 +575,7 @@ async fn mesh_bin(
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
     let id = app.check(id)?;
     let limit = p.limit.clamp(1_000, 5_000_000);
+    let _permit = app.heavy_permit().await?;
     let app2 = app.clone();
     let body = tokio::task::spawn_blocking(move || {
         let neighbors = match p.dir {
@@ -500,6 +654,7 @@ async fn path(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let from = app.check(p.from)?;
     let to = app.check(p.to)?;
+    let _permit = app.heavy_permit().await?;
     let app2 = app.clone();
     let found = tokio::task::spawn_blocking(move || {
         algo::shortest_path(&app2.g, from, to, MAX_BFS_VISITED)
@@ -537,6 +692,7 @@ async fn paths(
     let from = app.check(p.from)?;
     let to = app.check(p.to)?;
     let max_nodes = p.max_nodes.clamp(2, 2000);
+    let _permit = app.heavy_permit().await?;
     let app2 = app.clone();
     let found = tokio::task::spawn_blocking(move || {
         algo::shortest_path_dag(&app2.g, from, to, MAX_BFS_VISITED)
@@ -596,6 +752,7 @@ async fn distance(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let from = app.check(p.from)?;
     let to = app.check(p.to)?;
+    let _permit = app.heavy_permit().await?;
     let app2 = app.clone();
     let d = tokio::task::spawn_blocking(move || {
         algo::distance(&app2.g, from, to, MAX_BFS_VISITED)
@@ -682,6 +839,7 @@ async fn bfs_bin(
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
     let from = app.check(p.from)?;
     let max_depth = p.max_depth.min(254);
+    let _permit = app.heavy_permit().await?;
     let app2 = app.clone();
     let body = tokio::task::spawn_blocking(move || {
         let n = app2.g.node_count();
@@ -826,6 +984,7 @@ async fn edges_region(
         return Err(err(StatusCode::NOT_FOUND, "no atlas built"));
     }
     let limit = p.limit.clamp(1_000, 1_000_000);
+    let _permit = app.heavy_permit().await?;
     let app2 = app.clone();
     let body = tokio::task::spawn_blocking(move || {
         let skeleton = app2.skeleton.get_or_init(|| build_skeleton(&app2.g));
@@ -1056,6 +1215,7 @@ async fn game_new(
     if min_par > max_par {
         return Err(err(StatusCode::BAD_REQUEST, "min_par > max_par"));
     }
+    let _permit = app.heavy_permit().await?;
     let app2 = app.clone();
     let found = tokio::task::spawn_blocking(move || {
         let pool = &app2.top_rank_pool[..p.difficulty.pool_len(app2.top_rank_pool.len())];
@@ -1086,7 +1246,21 @@ async fn game_new(
     }
 }
 
-async fn random(State(app): State<Arc<App>>) -> Json<Node> {
+#[derive(Deserialize)]
+struct RandomParams {
+    /// Reject articles with fewer total links; keeps Random interesting.
+    #[serde(default)]
+    min_links: usize,
+}
+
+async fn random(State(app): State<Arc<App>>, Query(p): Query<RandomParams>) -> Json<Node> {
+    let min = p.min_links.min(1_000);
+    for _ in 0..200 {
+        let v = (app.next_rand() % app.g.node_count() as u64) as u32;
+        if app.g.out_degree(v) + app.g.in_degree(v) >= min {
+            return Json(app.node(v));
+        }
+    }
     let v = (app.next_rand() % app.g.node_count() as u64) as u32;
     Json(app.node(v))
 }
