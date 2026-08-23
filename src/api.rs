@@ -136,8 +136,12 @@ fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
     (code, Json(json!({ "error": msg })))
 }
 
-pub fn router(app: Arc<App>) -> Router {
-    Router::new()
+pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
+    let mut router = Router::new();
+    if let Some(dir) = tiles_dir {
+        router = router.nest_service("/tiles", tower_http::services::ServeDir::new(dir));
+    }
+    router
         .route("/healthz", get(|| async { "ok" }))
         .route("/stats", get(stats))
         .route("/search", get(search))

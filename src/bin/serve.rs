@@ -58,9 +58,12 @@ async fn main() -> Result<()> {
         if atlas.is_some() { "loaded" } else { "absent" }
     );
     let app = api::App::new(g, atlas);
+    let tiles_dir = graph_path.with_file_name("tiles");
+    let tiles = tiles_dir.is_dir().then_some(tiles_dir);
+    eprintln!("tiles: {}", if tiles.is_some() { "serving" } else { "absent" });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("listening on {addr}");
-    axum::serve(listener, api::router(app))
+    axum::serve(listener, api::router(app, tiles))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
