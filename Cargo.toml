@@ -27,3 +27,7 @@ path = "src/bin/ingest.rs"
 [[bin]]
 name = "serve"
 path = "src/bin/serve.rs"
+
+[[bin]]
+name = "atlas"
+path = "src/bin/atlas.rs"

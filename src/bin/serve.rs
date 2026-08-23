@@ -48,7 +48,16 @@ async fn main() -> Result<()> {
         g.node_count(),
         g.edge_count()
     );
-    let app = api::App::new(g);
+    // atlas.bin is optional; without it /atlas.bin 404s and everything else works
+    let atlas_path = graph_path.with_file_name("atlas.bin");
+    let atlas = std::fs::File::open(&atlas_path)
+        .ok()
+        .and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() });
+    eprintln!(
+        "atlas: {}",
+        if atlas.is_some() { "loaded" } else { "absent" }
+    );
+    let app = api::App::new(g, atlas);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("listening on {addr}");
     axum::serve(listener, api::router(app))

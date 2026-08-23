@@ -22,6 +22,8 @@ const MAX_BFS_VISITED: usize = 20_000_000;
 
 pub struct App {
     g: Graph,
+    /// Optional whole-graph layout, served verbatim (file bytes = wire bytes).
+    atlas: Option<memmap2::Mmap>,
     top_in: Vec<u32>,
     top_out: Vec<u32>,
     top_rank: Vec<u32>,
@@ -39,7 +41,7 @@ pub struct Node {
 }
 
 impl App {
-    pub fn new(g: Graph) -> Arc<Self> {
+    pub fn new(g: Graph, atlas: Option<memmap2::Mmap>) -> Arc<Self> {
         let n = g.node_count() as u32;
         let top = |key: &dyn Fn(u32) -> f64| -> Vec<u32> {
             let mut heap: BinaryHeap<(std::cmp::Reverse<u64>, u32)> = BinaryHeap::new();
@@ -62,6 +64,7 @@ impl App {
         let seed = std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos() as u64 | 1;
         Arc::new(App {
             g,
+            atlas,
             top_in,
             top_out,
             top_rank,
@@ -101,6 +104,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/node/{id}/links", get(links))
         .route("/node/{id}/neighbors.bin", get(neighbors_bin))
         .route("/titles", get(titles))
+        .route("/atlas.bin", get(atlas_bin))
         .route("/path", get(path))
         .route("/random", get(random))
         .route("/top", get(top))
@@ -259,6 +263,23 @@ async fn neighbors_bin(
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         body,
+    ))
+}
+
+/// The precomputed whole-graph layout, ~7 bytes per article.
+async fn atlas_bin(
+    State(app): State<Arc<App>>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
+    let atlas = app
+        .atlas
+        .as_ref()
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no atlas built"))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        atlas.to_vec(),
     ))
 }
 
