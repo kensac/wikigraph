@@ -27,6 +27,8 @@ pub struct App {
     top_in: Vec<u32>,
     top_out: Vec<u32>,
     top_rank: Vec<u32>,
+    /// Well-known, well-connected articles used to seed game puzzles.
+    top_rank_pool: Vec<u32>,
     rng: AtomicU64,
 }
 
@@ -61,6 +63,16 @@ impl App {
         let top_in = top(&|v| g.in_degree(v) as f64);
         let top_out = top(&|v| g.out_degree(v) as f64);
         let top_rank = top(&|v| g.rank(v) as f64);
+
+        // puzzle pool: top ~150k by rank that are traversable in both directions
+        let mut by_rank: Vec<u32> = (0..n).collect();
+        by_rank.sort_unstable_by(|&a, &b| g.rank(b).total_cmp(&g.rank(a)));
+        let top_rank_pool: Vec<u32> = by_rank
+            .into_iter()
+            .filter(|&v| g.out_degree(v) >= 20 && g.in_degree(v) >= 20)
+            .take(150_000)
+            .collect();
+
         let seed = std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos() as u64 | 1;
         Arc::new(App {
             g,
@@ -68,6 +80,7 @@ impl App {
             top_in,
             top_out,
             top_rank,
+            top_rank_pool,
             rng: AtomicU64::new(seed),
         })
     }
@@ -80,6 +93,16 @@ impl App {
             out_degree: self.g.out_degree(v),
             in_degree: self.g.in_degree(v),
         }
+    }
+
+    /// xorshift64*, good enough for picking pages
+    fn next_rand(&self) -> u64 {
+        let mut x = self.rng.load(Ordering::Relaxed);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng.store(x, Ordering::Relaxed);
+        x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
     fn check(&self, v: u32) -> Result<u32, (StatusCode, Json<Value>)> {
@@ -105,6 +128,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/node/{id}/neighbors.bin", get(neighbors_bin))
         .route("/titles", get(titles))
         .route("/atlas.bin", get(atlas_bin))
+        .route("/edge", get(edge))
+        .route("/distance", get(distance))
+        .route("/game/new", get(game_new))
         .route("/path", get(path))
         .route("/random", get(random))
         .route("/top", get(top))
@@ -332,14 +358,123 @@ async fn path(
     }
 }
 
+#[derive(Deserialize)]
+struct EdgeParams {
+    from: u32,
+    to: u32,
+}
+
+/// Whether a direct wikilink from -> to exists (neighbor lists are sorted).
+async fn edge(
+    State(app): State<Arc<App>>,
+    Query(p): Query<EdgeParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let from = app.check(p.from)?;
+    let to = app.check(p.to)?;
+    let exists = app.g.out(from).binary_search(&to).is_ok();
+    Ok(Json(json!({ "exists": exists })))
+}
+
+/// Hop count of the shortest path, without revealing the path itself.
+async fn distance(
+    State(app): State<Arc<App>>,
+    Query(p): Query<EdgeParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let from = app.check(p.from)?;
+    let to = app.check(p.to)?;
+    let app2 = app.clone();
+    let d = tokio::task::spawn_blocking(move || {
+        algo::distance(&app2.g, from, to, MAX_BFS_VISITED)
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "search failed"))?;
+    match d {
+        Some(d) => Ok(Json(json!({ "distance": d }))),
+        None => Err(err(StatusCode::NOT_FOUND, "no path found")),
+    }
+}
+
+#[derive(Deserialize)]
+struct GameParams {
+    #[serde(default = "default_min_par")]
+    min_par: usize,
+    #[serde(default = "default_max_par")]
+    max_par: usize,
+    #[serde(default)]
+    difficulty: Difficulty,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum Difficulty {
+    Easy,
+    #[default]
+    Medium,
+    Hard,
+}
+
+impl Difficulty {
+    /// How deep into the fame-ordered pool puzzles may draw from.
+    fn pool_len(self, full: usize) -> usize {
+        match self {
+            Difficulty::Easy => full.min(10_000),
+            Difficulty::Medium => full.min(50_000),
+            Difficulty::Hard => full,
+        }
+    }
+}
+
+fn default_min_par() -> usize {
+    3
+}
+
+fn default_max_par() -> usize {
+    5
+}
+
+/// A link-game puzzle: two well-known articles whose shortest chain is
+/// min_par..=max_par clicks. Well-known = top ~2% by pagerank with a real
+/// out-degree, so every step has reasonable choices.
+async fn game_new(
+    State(app): State<Arc<App>>,
+    Query(p): Query<GameParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (min_par, max_par) = (p.min_par.clamp(2, 8), p.max_par.clamp(2, 8));
+    if min_par > max_par {
+        return Err(err(StatusCode::BAD_REQUEST, "min_par > max_par"));
+    }
+    let app2 = app.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let pool = &app2.top_rank_pool[..p.difficulty.pool_len(app2.top_rank_pool.len())];
+        for _ in 0..200 {
+            let a = pool[app2.next_rand() as usize % pool.len()];
+            let b = pool[app2.next_rand() as usize % pool.len()];
+            if a == b {
+                continue;
+            }
+            // par computed on the real graph; cap visits so misses stay cheap
+            if let Some(d) = algo::distance(&app2.g, a, b, 2_000_000) {
+                if (min_par..=max_par).contains(&d) {
+                    return Some((a, b, d));
+                }
+            }
+        }
+        None
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "search failed"))?;
+    match found {
+        Some((a, b, d)) => Ok(Json(json!({
+            "from": app.node(a),
+            "to": app.node(b),
+            "par": d,
+        }))),
+        None => Err(err(StatusCode::SERVICE_UNAVAILABLE, "no puzzle found, retry")),
+    }
+}
+
 async fn random(State(app): State<Arc<App>>) -> Json<Node> {
-    // xorshift64*, good enough for picking a page
-    let mut x = app.rng.load(Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    app.rng.store(x, Ordering::Relaxed);
-    let v = (x.wrapping_mul(0x2545F4914F6CDD1D) % app.g.node_count() as u64) as u32;
+    let v = (app.next_rand() % app.g.node_count() as u64) as u32;
     Json(app.node(v))
 }
 

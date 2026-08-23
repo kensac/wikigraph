@@ -48,6 +48,11 @@ pub fn shortest_path(g: &Graph, from: u32, to: u32, max_visited: usize) -> Optio
     None
 }
 
+/// Number of hops from `from` to `to`, or None (same limits as shortest_path).
+pub fn distance(g: &Graph, from: u32, to: u32, max_visited: usize) -> Option<usize> {
+    shortest_path(g, from, to, max_visited).map(|p| p.len() - 1)
+}
+
 fn stitch(
     fwd: &HashMap<u32, u32>,
     bwd: &HashMap<u32, u32>,
