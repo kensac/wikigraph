@@ -209,8 +209,11 @@ pub fn build(data_dir: &Path, out_path: &Path, limits: Limits) -> Result<Stats> 
     lt.sort_unstable_by_key(|&(id, _)| id);
     eprintln!("[{:.0?}] link targets resolved: {}", t0.elapsed(), lt.len());
 
-    // pagelinks.sql: (pl_from, pl_from_namespace, pl_target_id) -> edges
-    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(1 << 30);
+    // pagelinks.sql: (pl_from, pl_from_namespace, pl_target_id) -> edges.
+    // Capacity sized above the observed ~90% keep rate on ~1.6B rows so the
+    // vec never doubles mid-stream (a realloc at this size would spike peak
+    // memory past what the machine has).
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(1_700_000_000);
     let mut scanned = 0u64;
     sql::for_each_row(open_dump(data_dir, "pagelinks")?, |row| {
         scanned += 1;
@@ -245,8 +248,9 @@ pub fn build(data_dir: &Path, out_path: &Path, limits: Limits) -> Result<Stats> 
     drop(rd_blob);
     eprintln!("[{:.0?}] raw edges: {}", t0.elapsed(), edges.len());
 
-    edges.sort_unstable();
+    rayon::slice::ParallelSliceMut::par_sort_unstable(edges.as_mut_slice());
     edges.dedup();
+    edges.shrink_to_fit();
     let m = edges.len();
     eprintln!("[{:.0?}] deduped edges: {m}", t0.elapsed());
 
@@ -278,7 +282,7 @@ pub fn build(data_dir: &Path, out_path: &Path, limits: Limits) -> Result<Stats> 
     drop(edges);
     eprintln!("[{:.0?}] CSR built", t0.elapsed());
 
-    let pagerank = pagerank(n, &out_offsets, &out_edges, 20, 0.85);
+    let pagerank = pagerank(n, &out_offsets, &in_offsets, &in_edges, 20, 0.85);
     eprintln!("[{:.0?}] pagerank done", t0.elapsed());
 
     // titles in dense (sorted) order
@@ -311,30 +315,54 @@ pub fn build(data_dir: &Path, out_path: &Path, limits: Limits) -> Result<Stats> 
 }
 
 /// Power iteration with uniform teleport and dangling-mass redistribution.
-fn pagerank(n: usize, out_offsets: &[u64], out_edges: &[u32], iters: usize, d: f32) -> Vec<f32> {
+/// Gather form over the in-CSR: each node sums its in-neighbors' contributions,
+/// so iterations parallelize with no write contention.
+fn pagerank(
+    n: usize,
+    out_offsets: &[u64],
+    in_offsets: &[u64],
+    in_edges: &[u32],
+    iters: usize,
+    d: f32,
+) -> Vec<f32> {
+    use rayon::prelude::*;
     if n == 0 {
         return Vec::new();
     }
+    let inv_out: Vec<f32> = (0..n)
+        .map(|v| {
+            let deg = out_offsets[v + 1] - out_offsets[v];
+            if deg == 0 {
+                0.0
+            } else {
+                1.0 / deg as f32
+            }
+        })
+        .collect();
     let mut rank = vec![1.0f32 / n as f32; n];
     let mut next = vec![0.0f32; n];
+    let mut contrib = vec![0.0f32; n];
     for _ in 0..iters {
-        next.fill(0.0);
-        let mut dangling = 0.0f64;
-        for v in 0..n {
-            let (s, e) = (out_offsets[v] as usize, out_offsets[v + 1] as usize);
-            if s == e {
-                dangling += rank[v] as f64;
-                continue;
-            }
-            let share = rank[v] / (e - s) as f32;
-            for &to in &out_edges[s..e] {
-                next[to as usize] += share;
-            }
-        }
+        let dangling: f64 = rank
+            .par_iter()
+            .zip(&inv_out)
+            .filter(|&(_, &inv)| inv == 0.0)
+            .map(|(&r, _)| r as f64)
+            .sum();
+        contrib
+            .par_iter_mut()
+            .zip(&rank)
+            .zip(&inv_out)
+            .for_each(|((c, &r), &inv)| *c = r * inv);
         let base = (1.0 - d) / n as f32 + d * (dangling as f32 / n as f32);
-        for r in next.iter_mut() {
-            *r = base + d * *r;
-        }
+        next.par_iter_mut().enumerate().for_each(|(v, out)| {
+            let (s, e) = (in_offsets[v] as usize, in_offsets[v + 1] as usize);
+            let mut sum = 0.0f32;
+            for &u in &in_edges[s..e] {
+                sum += contrib[u as usize];
+            }
+            *out = base + d * sum;
+        });
         std::mem::swap(&mut rank, &mut next);
     }
     rank
