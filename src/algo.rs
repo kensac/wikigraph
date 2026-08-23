@@ -53,15 +53,13 @@ pub fn distance(g: &Graph, from: u32, to: u32, max_visited: usize) -> Option<usi
     shortest_path(g, from, to, max_visited).map(|p| p.len() - 1)
 }
 
+/// (distance, nodes on any shortest path, edges on any shortest path)
+pub type PathDag = (usize, Vec<u32>, Vec<(u32, u32)>);
+
 /// The union of ALL shortest paths from `from` to `to`, as a DAG.
 /// A node is on some shortest path iff df[v] + db[v] == D; an edge (u,v) iff
-/// df[u] + 1 + db[v] == D. Returns (D, nodes, edges) or None if unreachable.
-pub fn shortest_path_dag(
-    g: &Graph,
-    from: u32,
-    to: u32,
-    max_visited: usize,
-) -> Option<(usize, Vec<u32>, Vec<(u32, u32)>)> {
+/// df[u] + 1 + db[v] == D. Returns None if unreachable.
+pub fn shortest_path_dag(g: &Graph, from: u32, to: u32, max_visited: usize) -> Option<PathDag> {
     let d = distance(g, from, to, max_visited)?;
     let df = bfs_depths(g, from, d as u8, false);
     let db = bfs_depths(g, to, d as u8, true);
