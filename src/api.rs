@@ -289,9 +289,9 @@ async fn search(
             let end = range.end.min(range.start + MAX_SEARCH_SCAN as u32);
             candidates.extend(range.start..end);
         }
-        // substring supplements thin prefix results ("einstein" must also
-        // surface Albert_Einstein); fuzzy is the last tier for typos
-        if candidates.len() < limit && q.len() >= 4 {
+        // substring always supplements for selective queries ("einstein"
+        // must surface Albert_Einstein even when prefix hits exist)
+        if q.len() >= 5 || (candidates.is_empty() && q.len() >= 3) {
             candidates.extend(substring_scan(g, &q));
         }
         if candidates.is_empty() && (4..=40).contains(&q.len()) {
@@ -348,22 +348,31 @@ fn fuzzy_scan(g: &Graph, needle: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Banded Levenshtein, ASCII case-insensitive, early-out above 2.
+/// Damerau-Levenshtein (optimal string alignment) within 2, ASCII
+/// case-insensitive, early-out. Transpositions cost 1, so two swapped-letter
+/// typos ("Albret Einstien") still match.
 fn edit_within_2(a: &[u8], b: &[u8]) -> bool {
     let (m, n) = (a.len(), b.len());
+    let mut prev2: Vec<u16> = vec![0; n + 1];
     let mut prev: Vec<u16> = (0..=n as u16).collect();
     let mut cur = vec![0u16; n + 1];
+    let eq = |x: u8, y: u8| x.eq_ignore_ascii_case(&y);
     for i in 1..=m {
         cur[0] = i as u16;
         let mut row_min = cur[0];
         for j in 1..=n {
-            let cost = u16::from(!a[i - 1].eq_ignore_ascii_case(&b[j - 1]));
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
-            row_min = row_min.min(cur[j]);
+            let cost = u16::from(!eq(a[i - 1], b[j - 1]));
+            let mut best = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            if i > 1 && j > 1 && eq(a[i - 1], b[j - 2]) && eq(a[i - 2], b[j - 1]) {
+                best = best.min(prev2[j - 2] + 1);
+            }
+            cur[j] = best;
+            row_min = row_min.min(best);
         }
         if row_min > 2 {
             return false;
         }
+        std::mem::swap(&mut prev2, &mut prev);
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[n] <= 2
