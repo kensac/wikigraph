@@ -1250,13 +1250,25 @@ async fn game_new(
     .await
     .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "search failed"))?;
     match found {
-        Some((a, b, d)) => Ok(Json(json!({
-            "from": app.node(a),
-            "to": app.node(b),
-            "par": d,
-        }))),
+        Some((a, b, d)) => Ok((
+            no_store(),
+            Json(json!({
+                "from": app.node(a),
+                "to": app.node(b),
+                "par": d,
+            })),
+        )),
         None => Err(err(StatusCode::SERVICE_UNAVAILABLE, "no puzzle found, retry")),
     }
+}
+
+/// Dynamic endpoints must opt out of the blanket public-cache header, or
+/// browsers/CDN would replay one response for an hour ("New game" bug).
+fn no_store() -> [(axum::http::HeaderName, axum::http::HeaderValue); 1] {
+    [(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    )]
 }
 
 #[derive(Deserialize)]
@@ -1266,16 +1278,19 @@ struct RandomParams {
     min_links: usize,
 }
 
-async fn random(State(app): State<Arc<App>>, Query(p): Query<RandomParams>) -> Json<Node> {
+async fn random(
+    State(app): State<Arc<App>>,
+    Query(p): Query<RandomParams>,
+) -> impl axum::response::IntoResponse {
     let min = p.min_links.min(1_000);
     for _ in 0..200 {
         let v = (app.next_rand() % app.g.node_count() as u64) as u32;
         if app.g.out_degree(v) + app.g.in_degree(v) >= min {
-            return Json(app.node(v));
+            return (no_store(), Json(app.node(v)));
         }
     }
     let v = (app.next_rand() % app.g.node_count() as u64) as u32;
-    Json(app.node(v))
+    (no_store(), Json(app.node(v)))
 }
 
 #[derive(Deserialize)]
