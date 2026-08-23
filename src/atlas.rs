@@ -171,14 +171,20 @@ fn meta_layout(
 ) -> Vec<(f32, f32)> {
     let k = sizes.len();
     let radii: Vec<f32> = sizes.iter().map(|&s| (s as f32).sqrt()).collect();
-    let total_r: f32 = radii.iter().sum();
-    // seed on a spiral, biggest first
+    // seed on an area-packed spiral, biggest at the center: position radius
+    // grows with the square root of cumulative disc area, so discs start out
+    // nearly disjoint instead of piled up
     let mut order: Vec<usize> = (0..k).collect();
     order.sort_unstable_by(|&a, &b| sizes[b].cmp(&sizes[a]));
     let mut pos = vec![(0.0f32, 0.0f32); k];
     const GOLDEN: f32 = 2.399_963;
+    let mut cum_area = 0.0f32;
     for (i, &c) in order.iter().enumerate() {
-        let r = total_r * 0.05 * (i as f32).sqrt();
+        cum_area += radii[c] * radii[c];
+        if i == 0 {
+            continue; // biggest community anchors the center
+        }
+        let r = (cum_area / std::f32::consts::PI).sqrt() * 1.9 + radii[c];
         let t = i as f32 * GOLDEN;
         pos[c] = (r * t.cos(), r * t.sin());
     }

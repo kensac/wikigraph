@@ -84,7 +84,27 @@ fn main() -> Result<()> {
     });
     eprintln!("accumulated in {:.0?}", t0.elapsed());
 
-    // tone map to 8-bit RGBA
+    // auto-expose: map the 99th percentile of nonzero energy near white,
+    // instead of a fixed constant that saturates dense regions
+    let mut sample: Vec<f32> = acc
+        .par_iter()
+        .step_by(997)
+        .filter_map(|a| {
+            let e = a.load(Ordering::Relaxed) as f32 / FP;
+            (e > 0.0).then_some(e)
+        })
+        .collect();
+    sample.par_sort_unstable_by(f32::total_cmp);
+    let p99 = sample
+        .get(sample.len().saturating_sub(sample.len() / 100 + 1))
+        .copied()
+        .unwrap_or(1.0);
+    let denom = (1.0 + p99).ln();
+    eprintln!("exposure: p99 energy {p99:.2}, log denom {denom:.3}");
+    drop(sample);
+
+    // log tone map to 8-bit RGBA: keeps faint filaments visible while the
+    // densest hubs still saturate gracefully
     let img: Vec<u8> = (0..size * size)
         .into_par_iter()
         .flat_map_iter(|i| {
@@ -92,11 +112,11 @@ fn main() -> Result<()> {
             let mut lum = 0.0f32;
             for c in 0..3 {
                 let e = acc[i * 3 + c].load(Ordering::Relaxed) as f32 / FP;
-                let v = 1.0 - (-e * 0.35).exp();
+                let v = ((1.0 + e).ln() / denom).min(1.0);
                 out[c] = (v.powf(1.0 / 2.2) * 255.0) as u8;
                 lum += v;
             }
-            out[3] = ((lum / 3.0).powf(0.5) * 255.0).min(255.0) as u8;
+            out[3] = ((lum / 3.0).powf(0.4) * 255.0).min(255.0) as u8;
             out
         })
         .collect();
@@ -123,7 +143,7 @@ fn community_color(comm: u16) -> [f32; 3] {
         return [0.5, 0.5, 0.55];
     }
     let hue = (comm as f32 * 137.508) % 360.0;
-    hsl_to_rgb(hue, 0.7, 0.6)
+    hsl_to_rgb(hue, 0.85, 0.55)
 }
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {

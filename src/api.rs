@@ -148,6 +148,7 @@ pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
         .route("/node/{id}", get(node))
         .route("/node/{id}/links", get(links))
         .route("/node/{id}/neighbors.bin", get(neighbors_bin))
+        .route("/node/{id}/mesh.bin", get(mesh_bin))
         .route("/titles", get(titles))
         .route("/atlas.bin", get(atlas_bin))
         .route("/edges.bin", get(edges_bin))
@@ -331,6 +332,73 @@ async fn atlas_bin(
             (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         atlas.to_vec(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct MeshBinParams {
+    #[serde(default)]
+    dir: Dir,
+    #[serde(default = "default_mesh_limit")]
+    limit: usize,
+}
+
+fn default_mesh_limit() -> usize {
+    2_000_000
+}
+
+/// All directed edges among {center} ∪ neighbors(center, dir), as packed LE
+/// [count u32][from: count x u32][to: count x u32]. When the induced set
+/// exceeds `limit`, the top edges by min-endpoint rank are kept. Membership
+/// tests use a bitmap over the id space, so even ISBN-sized sets stay fast.
+async fn mesh_bin(
+    State(app): State<Arc<App>>,
+    Path(id): Path<u32>,
+    Query(p): Query<MeshBinParams>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
+    let id = app.check(id)?;
+    let limit = p.limit.clamp(1_000, 5_000_000);
+    let app2 = app.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        let neighbors = match p.dir {
+            Dir::Out => app2.g.out(id),
+            Dir::In => app2.g.incoming(id),
+        };
+        let n = app2.g.node_count();
+        let mut bits = vec![0u64; n.div_ceil(64)];
+        let set = |bits: &mut [u64], v: u32| bits[v as usize / 64] |= 1 << (v % 64);
+        let test = |bits: &[u64], v: u32| bits[v as usize / 64] >> (v % 64) & 1 == 1;
+        set(&mut bits, id);
+        for &v in neighbors {
+            set(&mut bits, v);
+        }
+        let mut edges: Vec<(f32, u32, u32)> = Vec::new();
+        for &from in std::iter::once(&id).chain(neighbors.iter()) {
+            for &to in app2.g.out(from) {
+                if test(&bits, to) {
+                    edges.push((app2.g.rank(from).min(app2.g.rank(to)), from, to));
+                }
+            }
+        }
+        if edges.len() > limit {
+            edges.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            edges.truncate(limit);
+        }
+        let mut buf = Vec::with_capacity(4 + edges.len() * 8);
+        buf.extend_from_slice(&(edges.len() as u32).to_le_bytes());
+        for &(_, from, _) in &edges {
+            buf.extend_from_slice(&from.to_le_bytes());
+        }
+        for &(_, _, to) in &edges {
+            buf.extend_from_slice(&to.to_le_bytes());
+        }
+        buf
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "mesh failed"))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        body,
     ))
 }
 
