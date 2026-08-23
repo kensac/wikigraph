@@ -467,9 +467,9 @@ struct NeighborsBinParams {
 }
 
 /// The complete, uncapped neighbor set as packed little-endian binary:
-/// [count: u32][ids: count x u32][ranks: count x f32]. This is close to a
-/// straight copy out of the mmap'd CSR slice, so a 1.6M-degree hub is one
-/// ~13MB response with zero serialization cost.
+/// [count: u32][ids: count x u32][ranks: count x f32][communities: count x u16]
+/// (community 65535 when no atlas). Close to a straight copy out of the
+/// mmap'd CSR slice; a 1.6M-degree hub is one ~15MB response.
 async fn neighbors_bin(
     State(app): State<Arc<App>>,
     Path(id): Path<u32>,
@@ -483,13 +483,17 @@ async fn neighbors_bin(
             Dir::In => app2.g.incoming(id),
         };
         let n = neighbors.len();
-        let mut buf = Vec::with_capacity(4 + n * 8);
+        let mut buf = Vec::with_capacity(4 + n * 10);
         buf.extend_from_slice(&(n as u32).to_le_bytes());
         for &v in neighbors {
             buf.extend_from_slice(&v.to_le_bytes());
         }
         for &v in neighbors {
             buf.extend_from_slice(&app2.g.rank(v).to_le_bytes());
+        }
+        for &v in neighbors {
+            let c = app2.community_of(v).unwrap_or(u16::MAX);
+            buf.extend_from_slice(&c.to_le_bytes());
         }
         buf
     })
