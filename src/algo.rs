@@ -53,6 +53,59 @@ pub fn distance(g: &Graph, from: u32, to: u32, max_visited: usize) -> Option<usi
     shortest_path(g, from, to, max_visited).map(|p| p.len() - 1)
 }
 
+/// The union of ALL shortest paths from `from` to `to`, as a DAG.
+/// A node is on some shortest path iff df[v] + db[v] == D; an edge (u,v) iff
+/// df[u] + 1 + db[v] == D. Returns (D, nodes, edges) or None if unreachable.
+pub fn shortest_path_dag(
+    g: &Graph,
+    from: u32,
+    to: u32,
+    max_visited: usize,
+) -> Option<(usize, Vec<u32>, Vec<(u32, u32)>)> {
+    let d = distance(g, from, to, max_visited)?;
+    let df = bfs_depths(g, from, d as u8, false);
+    let db = bfs_depths(g, to, d as u8, true);
+    let on_path = |v: u32| {
+        let (a, b) = (df[v as usize], db[v as usize]);
+        a != u8::MAX && b != u8::MAX && a as usize + b as usize == d
+    };
+    let nodes: Vec<u32> = (0..g.node_count() as u32).filter(|&v| on_path(v)).collect();
+    let mut edges = Vec::new();
+    for &u in &nodes {
+        for &v in g.out(u) {
+            if db[v as usize] != u8::MAX
+                && df[u as usize] as usize + 1 + db[v as usize] as usize == d
+            {
+                edges.push((u, v));
+            }
+        }
+    }
+    Some((d, nodes, edges))
+}
+
+/// Depth-limited BFS depth map; `reverse` walks incoming edges.
+fn bfs_depths(g: &Graph, from: u32, max_depth: u8, reverse: bool) -> Vec<u8> {
+    let mut depth = vec![u8::MAX; g.node_count()];
+    depth[from as usize] = 0;
+    let mut frontier = vec![from];
+    let mut d = 0u8;
+    while !frontier.is_empty() && d < max_depth {
+        d += 1;
+        let mut next = Vec::new();
+        for &v in &frontier {
+            let neighbors = if reverse { g.incoming(v) } else { g.out(v) };
+            for &u in neighbors {
+                if depth[u as usize] == u8::MAX {
+                    depth[u as usize] = d;
+                    next.push(u);
+                }
+            }
+        }
+        frontier = next;
+    }
+    depth
+}
+
 fn stitch(
     fwd: &HashMap<u32, u32>,
     bwd: &HashMap<u32, u32>,

@@ -177,6 +177,7 @@ pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
         .route("/distance", get(distance))
         .route("/game/new", get(game_new))
         .route("/path", get(path))
+        .route("/paths", get(paths))
         .route("/random", get(random))
         .route("/top", get(top))
         .layer(CorsLayer::permissive())
@@ -468,6 +469,63 @@ async fn path(
         }
         None => Err(err(StatusCode::NOT_FOUND, "no path found")),
     }
+}
+
+#[derive(Deserialize)]
+struct PathsParams {
+    from: u32,
+    to: u32,
+    #[serde(default = "default_paths_max_nodes")]
+    max_nodes: usize,
+}
+
+fn default_paths_max_nodes() -> usize {
+    500
+}
+
+/// ALL shortest paths between two articles, as a DAG. When the DAG exceeds
+/// max_nodes, the highest-ranked nodes are kept (endpoints always included)
+/// and the edge set is filtered to survivors; totals report the full size.
+async fn paths(
+    State(app): State<Arc<App>>,
+    Query(p): Query<PathsParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let from = app.check(p.from)?;
+    let to = app.check(p.to)?;
+    let max_nodes = p.max_nodes.clamp(2, 2000);
+    let app2 = app.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        algo::shortest_path_dag(&app2.g, from, to, MAX_BFS_VISITED)
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "search failed"))?;
+    let Some((d, mut nodes, edges)) = found else {
+        return Err(err(StatusCode::NOT_FOUND, "no path found"));
+    };
+    let (total_nodes, total_edges) = (nodes.len(), edges.len());
+    if nodes.len() > max_nodes {
+        nodes.sort_unstable_by(|&a, &b| app.g.rank(b).total_cmp(&app.g.rank(a)));
+        nodes.truncate(max_nodes);
+        for v in [from, to] {
+            if !nodes.contains(&v) {
+                nodes.push(v);
+            }
+        }
+    }
+    let keep: std::collections::HashSet<u32> = nodes.iter().copied().collect();
+    let edges: Vec<[u32; 2]> = edges
+        .into_iter()
+        .filter(|&(u, v)| keep.contains(&u) && keep.contains(&v))
+        .map(|(u, v)| [u, v])
+        .collect();
+    let items: Vec<Node> = nodes.into_iter().map(|v| app.node(v)).collect();
+    Ok(Json(json!({
+        "distance": d,
+        "totalNodes": total_nodes,
+        "totalEdges": total_edges,
+        "nodes": items,
+        "edges": edges,
+    })))
 }
 
 #[derive(Deserialize)]
