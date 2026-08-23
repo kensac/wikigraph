@@ -113,6 +113,19 @@ impl App {
         Some(u16::from_le_bytes(bytes.try_into().ok()?))
     }
 
+    /// Atlas position of a node (x section at 12, y section at 12 + 2n).
+    fn pos_of(&self, v: u32) -> Option<(u16, u16)> {
+        let atlas = self.atlas.as_ref()?;
+        let n = self.g.node_count();
+        let x = atlas.get(12 + 2 * v as usize..12 + 2 * v as usize + 2)?;
+        let yo = 12 + 2 * n + 2 * v as usize;
+        let y = atlas.get(yo..yo + 2)?;
+        Some((
+            u16::from_le_bytes(x.try_into().ok()?),
+            u16::from_le_bytes(y.try_into().ok()?),
+        ))
+    }
+
     /// xorshift64*, good enough for picking pages
     fn next_rand(&self) -> u64 {
         let mut x = self.rng.load(Ordering::Relaxed);
@@ -152,6 +165,7 @@ pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
         .route("/titles", get(titles))
         .route("/atlas.bin", get(atlas_bin))
         .route("/edges.bin", get(edges_bin))
+        .route("/edges_region.bin", get(edges_region))
         .route("/edge", get(edge))
         .route("/links_among", get(links_among))
         .route("/neighborhood", get(neighborhood))
@@ -526,6 +540,66 @@ async fn edges_bin(
             (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
             (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
         ],
+        body,
+    ))
+}
+
+#[derive(Deserialize)]
+struct RegionParams {
+    x0: u16,
+    y0: u16,
+    x1: u16,
+    y1: u16,
+    #[serde(default = "default_region_limit")]
+    limit: usize,
+}
+
+fn default_region_limit() -> usize {
+    200_000
+}
+
+/// Viewport virtualization for the skeleton: the highest-ranked edges with an
+/// endpoint inside the given atlas-coordinate rect. The skeleton is already
+/// rank-sorted, so this is a linear scan with early exit — a few ms.
+async fn edges_region(
+    State(app): State<Arc<App>>,
+    Query(p): Query<RegionParams>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
+    if app.atlas.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "no atlas built"));
+    }
+    let limit = p.limit.clamp(1_000, 1_000_000);
+    let app2 = app.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        let skeleton = app2.skeleton.get_or_init(|| build_skeleton(&app2.g));
+        let inside = |v: u32| {
+            app2.pos_of(v).is_some_and(|(x, y)| {
+                x >= p.x0 && x <= p.x1 && y >= p.y0 && y <= p.y1
+            })
+        };
+        let mut edges = Vec::with_capacity(limit.min(65_536));
+        for &(from, to) in skeleton.iter() {
+            if inside(from) || inside(to) {
+                edges.push((from, to));
+                if edges.len() >= limit {
+                    break;
+                }
+            }
+        }
+        let mut buf = Vec::with_capacity(4 + edges.len() * 8);
+        buf.extend_from_slice(&(edges.len() as u32).to_le_bytes());
+        for &(from, _) in &edges {
+            buf.extend_from_slice(&from.to_le_bytes());
+        }
+        for &(_, to) in &edges {
+            buf.extend_from_slice(&to.to_le_bytes());
+        }
+        buf
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "region failed"))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         body,
     ))
 }
