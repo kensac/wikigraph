@@ -99,7 +99,8 @@ fn main() -> Result<()> {
         .get(sample.len().saturating_sub(sample.len() / 100 + 1))
         .copied()
         .unwrap_or(1.0);
-    let denom = (1.0 + p99).ln();
+    // halved denom = ~2x exposure: tiles must glow through the point cloud
+    let denom = ((1.0 + p99).ln() * 0.5).max(0.1);
     eprintln!("exposure: p99 energy {p99:.2}, log denom {denom:.3}");
     drop(sample);
 
