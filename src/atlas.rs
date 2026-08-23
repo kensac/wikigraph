@@ -52,7 +52,7 @@ pub fn build(g: &Graph, out_path: &Path, lp_iters: usize) -> Result<()> {
         for &u in g.out(v).iter().step_by(7) {
             let b = comm[u as usize];
             if a != b && a != OTHER && b != OTHER {
-                *weights.entry((a.min(b), a.max(b)), ).or_insert(0) += 1;
+                *weights.entry((a.min(b), a.max(b))).or_insert(0) += 1;
             }
         }
     }
@@ -96,7 +96,8 @@ pub fn build(g: &Graph, out_path: &Path, lp_iters: usize) -> Result<()> {
     }
     let sx = 65535.0 / (max_x - min_x).max(1e-6);
     let sy = 65535.0 / (max_y - min_y).max(1e-6);
-    let quant = |v: f32, min: f32, s: f32| -> u16 { ((v - min) * s).round().clamp(0.0, 65535.0) as u16 };
+    let quant =
+        |v: f32, min: f32, s: f32| -> u16 { ((v - min) * s).round().clamp(0.0, 65535.0) as u16 };
 
     // Rank as a percentile byte (255 = top).
     let mut rank_order: Vec<u32> = (0..n as u32).collect();
@@ -122,7 +123,12 @@ pub fn build(g: &Graph, out_path: &Path, lp_iters: usize) -> Result<()> {
     }
     w.write_all(&rank_pct)?;
     w.flush()?;
-    eprintln!("wrote {} ({} nodes, {} communities)", out_path.display(), n, n_comm);
+    eprintln!(
+        "wrote {} ({} nodes, {} communities)",
+        out_path.display(),
+        n,
+        n_comm
+    );
     Ok(())
 }
 
@@ -148,11 +154,7 @@ fn label_propagation(g: &Graph, iters: usize) -> Vec<u32> {
                     .unwrap_or(labels[v as usize])
             })
             .collect();
-        let changed = labels
-            .par_iter()
-            .zip(&next)
-            .filter(|(a, b)| a != b)
-            .count();
+        let changed = labels.par_iter().zip(&next).filter(|(a, b)| a != b).count();
         labels = next;
         eprintln!("label propagation iter {}: {} changed", it + 1, changed);
         if changed < n / 1000 {

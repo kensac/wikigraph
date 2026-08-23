@@ -144,7 +144,9 @@ impl App {
     }
 
     /// Queue expensive work behind the shared semaphore.
-    async fn heavy_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, (StatusCode, Json<Value>)> {
+    async fn heavy_permit(
+        &self,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, (StatusCode, Json<Value>)> {
         self.heavy
             .acquire()
             .await
@@ -221,10 +223,12 @@ pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
         .layer(tower_http::compression::CompressionLayer::new())
         // everything is immutable between data snapshots; let browsers and the
         // CDN cache anything that doesn't set its own policy
-        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
-            axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("public, max-age=3600"),
-        ))
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("public, max-age=3600"),
+            ),
+        )
         .with_state(app)
 }
 
@@ -387,7 +391,8 @@ fn substring_scan(g: &Graph, needle: &str) -> Vec<u32> {
         .filter(|&v| {
             let t = g.title_bytes(v);
             t.len() >= needle.len()
-                && t.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+                && t.windows(needle.len())
+                    .any(|w| w.eq_ignore_ascii_case(needle))
         })
         .collect();
     hits.truncate(MAX_SEARCH_SCAN);
@@ -767,11 +772,9 @@ async fn distance(
     let to = app.check(p.to)?;
     let _permit = app.heavy_permit().await?;
     let app2 = app.clone();
-    let d = tokio::task::spawn_blocking(move || {
-        algo::distance(&app2.g, from, to, MAX_BFS_VISITED)
-    })
-    .await
-    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "search failed"))?;
+    let d = tokio::task::spawn_blocking(move || algo::distance(&app2.g, from, to, MAX_BFS_VISITED))
+        .await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "search failed"))?;
     match d {
         Some(d) => Ok(Json(json!({ "distance": d }))),
         None => Err(err(StatusCode::NOT_FOUND, "no path found")),
@@ -1002,9 +1005,8 @@ async fn edges_region(
     let body = tokio::task::spawn_blocking(move || {
         let skeleton = app2.skeleton.get_or_init(|| build_skeleton(&app2.g));
         let inside = |v: u32| {
-            app2.pos_of(v).is_some_and(|(x, y)| {
-                x >= p.x0 && x <= p.x1 && y >= p.y0 && y <= p.y1
-            })
+            app2.pos_of(v)
+                .is_some_and(|(x, y)| x >= p.x0 && x <= p.x1 && y >= p.y0 && y <= p.y1)
         };
         let mut edges = Vec::with_capacity(limit.min(65_536));
         for &(from, to) in skeleton.iter() {
@@ -1071,7 +1073,11 @@ fn build_skeleton(g: &Graph) -> Vec<(u32, u32)> {
         .collect();
     edges.par_sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
     edges.truncate(SKELETON_MAX);
-    eprintln!("skeleton built: {} edges (threshold {:.3e})", edges.len(), threshold);
+    eprintln!(
+        "skeleton built: {} edges (threshold {:.3e})",
+        edges.len(),
+        threshold
+    );
     edges.into_iter().map(|(_, f, t)| (f, t)).collect()
 }
 
@@ -1258,7 +1264,10 @@ async fn game_new(
                 "par": d,
             })),
         )),
-        None => Err(err(StatusCode::SERVICE_UNAVAILABLE, "no puzzle found, retry")),
+        None => Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no puzzle found, retry",
+        )),
     }
 }
 

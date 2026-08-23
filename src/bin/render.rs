@@ -40,11 +40,15 @@ fn main() -> Result<()> {
             other => bail!("unknown flag {other}"),
         }
     }
-    ensure!(size.is_power_of_two() && size >= TILE, "size must be a power of two >= 256");
+    ensure!(
+        size.is_power_of_two() && size >= TILE,
+        "size must be a power of two >= 256"
+    );
 
     let g = Graph::open(&graph_path)?;
     let n = g.node_count();
-    let atlas = std::fs::read(&atlas_path).with_context(|| format!("read {}", atlas_path.display()))?;
+    let atlas =
+        std::fs::read(&atlas_path).with_context(|| format!("read {}", atlas_path.display()))?;
     ensure!(atlas.len() == 12 + n * 7, "atlas does not match graph");
     let u16_at = |off: usize, i: usize| -> u16 {
         u16::from_le_bytes([atlas[off + 2 * i], atlas[off + 2 * i + 1]])
@@ -53,15 +57,24 @@ fn main() -> Result<()> {
 
     // node -> raster position and community color
     let scale = (size - 1) as f32 / 65535.0;
-    let px: Vec<f32> = (0..n).into_par_iter().map(|i| u16_at(x_off, i) as f32 * scale).collect();
-    let py: Vec<f32> = (0..n).into_par_iter().map(|i| u16_at(y_off, i) as f32 * scale).collect();
+    let px: Vec<f32> = (0..n)
+        .into_par_iter()
+        .map(|i| u16_at(x_off, i) as f32 * scale)
+        .collect();
+    let py: Vec<f32> = (0..n)
+        .into_par_iter()
+        .map(|i| u16_at(y_off, i) as f32 * scale)
+        .collect();
     let colors: Vec<[f32; 3]> = (0..n)
         .into_par_iter()
         .map(|i| community_color(u16_at(c_off, i)))
         .collect();
 
     // additive accumulation in fixed point
-    eprintln!("accumulating {} edges into {size}x{size}...", g.edge_count());
+    eprintln!(
+        "accumulating {} edges into {size}x{size}...",
+        g.edge_count()
+    );
     let t0 = std::time::Instant::now();
     let acc: Vec<AtomicU32> = (0..size * size * 3).map(|_| AtomicU32::new(0)).collect();
     (0..n as u32).into_par_iter().for_each(|v| {
@@ -184,21 +197,24 @@ fn downsample(img: &[u8], size: usize) -> Vec<u8> {
 
 fn write_tiles(out_dir: &std::path::Path, z: usize, level_size: usize, img: &[u8]) -> Result<()> {
     let tiles = level_size / TILE;
-    (0..tiles * tiles).into_par_iter().try_for_each(|i| -> Result<()> {
-        let (tx, ty) = (i % tiles, i / tiles);
-        let dir = out_dir.join(z.to_string()).join(tx.to_string());
-        std::fs::create_dir_all(&dir)?;
-        let mut buf = Vec::with_capacity(TILE * TILE * 4);
-        for row in 0..TILE {
-            let start = ((ty * TILE + row) * level_size + tx * TILE) * 4;
-            buf.extend_from_slice(&img[start..start + TILE * 4]);
-        }
-        let file = std::fs::File::create(dir.join(format!("{ty}.png")))?;
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), TILE as u32, TILE as u32);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc.write_header()?;
-        writer.write_image_data(&buf)?;
-        Ok(())
-    })
+    (0..tiles * tiles)
+        .into_par_iter()
+        .try_for_each(|i| -> Result<()> {
+            let (tx, ty) = (i % tiles, i / tiles);
+            let dir = out_dir.join(z.to_string()).join(tx.to_string());
+            std::fs::create_dir_all(&dir)?;
+            let mut buf = Vec::with_capacity(TILE * TILE * 4);
+            for row in 0..TILE {
+                let start = ((ty * TILE + row) * level_size + tx * TILE) * 4;
+                buf.extend_from_slice(&img[start..start + TILE * 4]);
+            }
+            let file = std::fs::File::create(dir.join(format!("{ty}.png")))?;
+            let mut enc =
+                png::Encoder::new(std::io::BufWriter::new(file), TILE as u32, TILE as u32);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header()?;
+            writer.write_image_data(&buf)?;
+            Ok(())
+        })
 }

@@ -26,8 +26,7 @@ fn check(addr: &str) -> Result<()> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     let mut graph_path = PathBuf::from("data/graph.bin");
@@ -66,7 +65,10 @@ async fn main() -> Result<()> {
     let app = api::App::new(g, atlas);
     let tiles_dir = graph_path.with_file_name("tiles");
     let tiles = tiles_dir.is_dir().then_some(tiles_dir);
-    eprintln!("tiles: {}", if tiles.is_some() { "serving" } else { "absent" });
+    eprintln!(
+        "tiles: {}",
+        if tiles.is_some() { "serving" } else { "absent" }
+    );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("listening on {addr}");
     axum::serve(listener, api::router(app, tiles))
