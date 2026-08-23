@@ -29,8 +29,12 @@ pub struct App {
     top_rank: Vec<u32>,
     /// Well-known, well-connected articles used to seed game puzzles.
     top_rank_pool: Vec<u32>,
+    /// Top edges by min-endpoint rank, built lazily for the skeleton mode.
+    skeleton: std::sync::OnceLock<Vec<(u32, u32)>>,
     rng: AtomicU64,
 }
+
+const SKELETON_MAX: usize = 5_000_000;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +88,7 @@ impl App {
             top_out,
             top_rank,
             top_rank_pool,
+            skeleton: std::sync::OnceLock::new(),
             rng: AtomicU64::new(seed),
         })
     }
@@ -141,6 +146,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/node/{id}/neighbors.bin", get(neighbors_bin))
         .route("/titles", get(titles))
         .route("/atlas.bin", get(atlas_bin))
+        .route("/edges.bin", get(edges_bin))
         .route("/edge", get(edge))
         .route("/links_among", get(links_among))
         .route("/neighborhood", get(neighborhood))
@@ -407,6 +413,91 @@ async fn distance(
         Some(d) => Ok(Json(json!({ "distance": d }))),
         None => Err(err(StatusCode::NOT_FOUND, "no path found")),
     }
+}
+
+#[derive(Deserialize)]
+struct EdgesBinParams {
+    #[serde(default = "default_edges_limit")]
+    limit: usize,
+}
+
+fn default_edges_limit() -> usize {
+    2_000_000
+}
+
+/// The graph's skeleton: the top edges scored by the weaker endpoint's rank,
+/// as packed LE [count u32][from: count x u32][to: count x u32]. Pairs with
+/// atlas.bin positions to draw the whole graph's structure in one overlay.
+async fn edges_bin(
+    State(app): State<Arc<App>>,
+    Query(p): Query<EdgesBinParams>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
+    let limit = p.limit.clamp(100_000, SKELETON_MAX);
+    let app2 = app.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        let skeleton = app2.skeleton.get_or_init(|| build_skeleton(&app2.g));
+        let take = limit.min(skeleton.len());
+        let mut buf = Vec::with_capacity(4 + take * 8);
+        buf.extend_from_slice(&(take as u32).to_le_bytes());
+        for &(from, _) in &skeleton[..take] {
+            buf.extend_from_slice(&from.to_le_bytes());
+        }
+        for &(_, to) in &skeleton[..take] {
+            buf.extend_from_slice(&to.to_le_bytes());
+        }
+        buf
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "skeleton failed"))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    ))
+}
+
+/// Threshold-sample then collect: estimate the score cutoff for the top
+/// SKELETON_MAX edges from a stride sample, gather everything above it in
+/// parallel, then sort and truncate exactly.
+fn build_skeleton(g: &Graph) -> Vec<(u32, u32)> {
+    use rayon::prelude::*;
+    let n = g.node_count() as u32;
+    let m = g.edge_count();
+    let score = |a: u32, b: u32| g.rank(a).min(g.rank(b));
+
+    let mut sample: Vec<f32> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|v| {
+            g.out(v)
+                .iter()
+                .step_by(128)
+                .map(move |&to| score(v, to))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let want_in_sample = ((SKELETON_MAX as f64 / m as f64) * sample.len() as f64) as usize;
+    let cut_idx = sample.len().saturating_sub(want_in_sample.max(1));
+    sample.par_sort_unstable_by(f32::total_cmp);
+    let threshold = sample.get(cut_idx).copied().unwrap_or(0.0);
+
+    let mut edges: Vec<(f32, u32, u32)> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|v| {
+            g.out(v)
+                .iter()
+                .filter_map(move |&to| {
+                    let s = score(v, to);
+                    (s >= threshold).then_some((s, v, to))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    edges.par_sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    edges.truncate(SKELETON_MAX);
+    eprintln!("skeleton built: {} edges (threshold {:.3e})", edges.len(), threshold);
+    edges.into_iter().map(|(_, f, t)| (f, t)).collect()
 }
 
 #[derive(Deserialize)]
