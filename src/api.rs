@@ -170,6 +170,7 @@ pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
         .route("/edges.bin", get(edges_bin))
         .route("/edges_region.bin", get(edges_region))
         .route("/communities", get(communities))
+        .route("/bfs.bin", get(bfs_bin))
         .route("/edge", get(edge))
         .route("/links_among", get(links_among))
         .route("/neighborhood", get(neighborhood))
@@ -544,6 +545,73 @@ async fn edges_bin(
             (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
             (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
         ],
+        body,
+    ))
+}
+
+#[derive(Deserialize)]
+struct BfsParams {
+    from: u32,
+    #[serde(default)]
+    dir: BfsDir,
+    #[serde(default = "default_bfs_depth")]
+    max_depth: u8,
+}
+
+#[derive(Deserialize, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum BfsDir {
+    #[default]
+    Out,
+    In,
+    Both,
+}
+
+fn default_bfs_depth() -> u8 {
+    12
+}
+
+/// Whole-graph BFS depth map from one seed: one u8 per node (255 = beyond
+/// max_depth or unreachable). ~7MB; a precomputed input for code-mode scripts
+/// ("color everything by distance from X") that a browser could not derive.
+async fn bfs_bin(
+    State(app): State<Arc<App>>,
+    Query(p): Query<BfsParams>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
+    let from = app.check(p.from)?;
+    let max_depth = p.max_depth.min(254);
+    let app2 = app.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        let n = app2.g.node_count();
+        let mut depth = vec![255u8; n];
+        depth[from as usize] = 0;
+        let mut frontier = vec![from];
+        let mut d = 0u8;
+        while !frontier.is_empty() && d < max_depth {
+            d += 1;
+            let mut next = Vec::new();
+            for &v in &frontier {
+                let mut push = |u: u32| {
+                    if depth[u as usize] == 255 {
+                        depth[u as usize] = d;
+                        next.push(u);
+                    }
+                };
+                if p.dir != BfsDir::In {
+                    app2.g.out(v).iter().copied().for_each(&mut push);
+                }
+                if p.dir != BfsDir::Out {
+                    app2.g.incoming(v).iter().copied().for_each(&mut push);
+                }
+            }
+            frontier = next;
+        }
+        depth
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "bfs failed"))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         body,
     ))
 }
