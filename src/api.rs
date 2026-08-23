@@ -99,6 +99,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/search", get(search))
         .route("/node/{id}", get(node))
         .route("/node/{id}/links", get(links))
+        .route("/node/{id}/neighbors.bin", get(neighbors_bin))
+        .route("/titles", get(titles))
         .route("/path", get(path))
         .route("/random", get(random))
         .route("/top", get(top))
@@ -217,6 +219,69 @@ async fn links(
         .map(|(_, v)| app.node(v))
         .collect();
     Ok(Json(json!({ "total": neighbors.len(), "items": items })))
+}
+
+#[derive(Deserialize)]
+struct NeighborsBinParams {
+    #[serde(default)]
+    dir: Dir,
+}
+
+/// The complete, uncapped neighbor set as packed little-endian binary:
+/// [count: u32][ids: count x u32][ranks: count x f32]. This is close to a
+/// straight copy out of the mmap'd CSR slice, so a 1.6M-degree hub is one
+/// ~13MB response with zero serialization cost.
+async fn neighbors_bin(
+    State(app): State<Arc<App>>,
+    Path(id): Path<u32>,
+    Query(p): Query<NeighborsBinParams>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
+    let id = app.check(id)?;
+    let app2 = app.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        let neighbors = match p.dir {
+            Dir::Out => app2.g.out(id),
+            Dir::In => app2.g.incoming(id),
+        };
+        let n = neighbors.len();
+        let mut buf = Vec::with_capacity(4 + n * 8);
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        for &v in neighbors {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in neighbors {
+            buf.extend_from_slice(&app2.g.rank(v).to_le_bytes());
+        }
+        buf
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "gather failed"))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        body,
+    ))
+}
+
+#[derive(Deserialize)]
+struct TitlesParams {
+    /// Comma-separated node ids, at most 1000.
+    ids: String,
+}
+
+async fn titles(
+    State(app): State<Arc<App>>,
+    Query(p): Query<TitlesParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut items = serde_json::Map::new();
+    for part in p.ids.split(',').take(1000) {
+        let Ok(id) = part.trim().parse::<u32>() else {
+            return Err(err(StatusCode::BAD_REQUEST, "bad id list"));
+        };
+        if (id as usize) < app.g.node_count() {
+            items.insert(id.to_string(), json!(app.g.title(id)));
+        }
+    }
+    Ok(Json(json!({ "titles": items })))
 }
 
 #[derive(Deserialize)]
