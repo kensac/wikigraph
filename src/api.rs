@@ -31,6 +31,8 @@ pub struct App {
     top_rank_pool: Vec<u32>,
     /// Top edges by min-endpoint rank, built lazily for the skeleton mode.
     skeleton: std::sync::OnceLock<Vec<(u32, u32)>>,
+    /// Per-community stats for semantic zoom, built lazily from the atlas.
+    communities: std::sync::OnceLock<Vec<CommunityInfo>>,
     rng: AtomicU64,
 }
 
@@ -89,6 +91,7 @@ impl App {
             top_rank,
             top_rank_pool,
             skeleton: std::sync::OnceLock::new(),
+            communities: std::sync::OnceLock::new(),
             rng: AtomicU64::new(seed),
         })
     }
@@ -166,6 +169,7 @@ pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
         .route("/atlas.bin", get(atlas_bin))
         .route("/edges.bin", get(edges_bin))
         .route("/edges_region.bin", get(edges_region))
+        .route("/communities", get(communities))
         .route("/edge", get(edge))
         .route("/links_among", get(links_among))
         .route("/neighborhood", get(neighborhood))
@@ -542,6 +546,89 @@ async fn edges_bin(
         ],
         body,
     ))
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CommunityInfo {
+    id: u16,
+    size: u32,
+    /// Title of the community's highest-ranked member: its de facto name.
+    label: String,
+    top_id: u32,
+    /// Centroid in atlas u16 coordinates.
+    x: u16,
+    y: u16,
+}
+
+#[derive(Deserialize)]
+struct CommunitiesParams {
+    #[serde(default = "default_communities_limit")]
+    limit: usize,
+}
+
+fn default_communities_limit() -> usize {
+    200
+}
+
+/// Communities ordered by size, for semantic zoom: far out, the map shows
+/// named community blobs instead of raw articles.
+async fn communities(
+    State(app): State<Arc<App>>,
+    Query(p): Query<CommunitiesParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if app.atlas.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "no atlas built"));
+    }
+    let app2 = app.clone();
+    let list = tokio::task::spawn_blocking(move || {
+        app2.communities
+            .get_or_init(|| build_communities(&app2))
+            .clone()
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "communities failed"))?;
+    let items: Vec<&CommunityInfo> = list.iter().take(p.limit.min(2000)).collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+fn build_communities(app: &App) -> Vec<CommunityInfo> {
+    #[derive(Default, Clone)]
+    struct Acc {
+        size: u32,
+        sum_x: u64,
+        sum_y: u64,
+        top: u32,
+        top_rank: f32,
+    }
+    let mut accs: std::collections::HashMap<u16, Acc> = std::collections::HashMap::new();
+    for v in 0..app.g.node_count() as u32 {
+        let (Some(c), Some((x, y))) = (app.community_of(v), app.pos_of(v)) else {
+            continue;
+        };
+        let a = accs.entry(c).or_default();
+        a.size += 1;
+        a.sum_x += x as u64;
+        a.sum_y += y as u64;
+        let r = app.g.rank(v);
+        if r > a.top_rank {
+            a.top_rank = r;
+            a.top = v;
+        }
+    }
+    let mut list: Vec<CommunityInfo> = accs
+        .into_iter()
+        .map(|(id, a)| CommunityInfo {
+            id,
+            size: a.size,
+            label: app.g.title(a.top).to_string(),
+            top_id: a.top,
+            x: (a.sum_x / a.size as u64) as u16,
+            y: (a.sum_y / a.size as u64) as u16,
+        })
+        .collect();
+    list.sort_unstable_by_key(|c| std::cmp::Reverse(c.size));
+    list
 }
 
 #[derive(Deserialize)]
