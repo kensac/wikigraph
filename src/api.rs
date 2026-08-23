@@ -40,6 +40,9 @@ pub struct Node {
     rank: f32,
     out_degree: usize,
     in_degree: usize,
+    /// Atlas community id, when an atlas is loaded (65535 = "other").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    community: Option<u16>,
 }
 
 impl App {
@@ -92,7 +95,17 @@ impl App {
             rank: self.g.rank(v),
             out_degree: self.g.out_degree(v),
             in_degree: self.g.in_degree(v),
+            community: self.community_of(v),
         }
+    }
+
+    /// Community section lives at byte 12 + 4n in the atlas (after x and y).
+    fn community_of(&self, v: u32) -> Option<u16> {
+        let atlas = self.atlas.as_ref()?;
+        let n = self.g.node_count();
+        let off = 12 + 4 * n + 2 * v as usize;
+        let bytes = atlas.get(off..off + 2)?;
+        Some(u16::from_le_bytes(bytes.try_into().ok()?))
     }
 
     /// xorshift64*, good enough for picking pages
@@ -129,6 +142,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/titles", get(titles))
         .route("/atlas.bin", get(atlas_bin))
         .route("/edge", get(edge))
+        .route("/links_among", get(links_among))
+        .route("/neighborhood", get(neighborhood))
         .route("/distance", get(distance))
         .route("/game/new", get(game_new))
         .route("/path", get(path))
@@ -392,6 +407,110 @@ async fn distance(
         Some(d) => Ok(Json(json!({ "distance": d }))),
         None => Err(err(StatusCode::NOT_FOUND, "no path found")),
     }
+}
+
+#[derive(Deserialize)]
+struct LinksAmongParams {
+    /// Comma-separated node ids, at most 1000.
+    ids: String,
+}
+
+/// Every directed edge among the given nodes: the induced subgraph. Lets the
+/// canvas show cross-links between articles that arrived via different
+/// expansions.
+async fn links_among(
+    State(app): State<Arc<App>>,
+    Query(p): Query<LinksAmongParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut ids = Vec::new();
+    for part in p.ids.split(',').take(1000) {
+        let Ok(id) = part.trim().parse::<u32>() else {
+            return Err(err(StatusCode::BAD_REQUEST, "bad id list"));
+        };
+        if (id as usize) < app.g.node_count() {
+            ids.push(id);
+        }
+    }
+    let set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    let mut edges = Vec::new();
+    for &from in &ids {
+        for &to in app.g.out(from) {
+            if set.contains(&to) {
+                edges.push([from, to]);
+            }
+        }
+    }
+    Ok(Json(json!({ "edges": edges })))
+}
+
+#[derive(Deserialize)]
+struct NeighborhoodParams {
+    id: u32,
+    #[serde(default = "default_depth")]
+    depth: usize,
+    #[serde(default = "default_max_nodes")]
+    max_nodes: usize,
+}
+
+fn default_depth() -> usize {
+    2
+}
+
+fn default_max_nodes() -> usize {
+    50
+}
+
+/// One-shot subgraph drop: rank-prioritized BFS out from a seed to `depth`
+/// hops, capped at `max_nodes`, plus the induced edge set.
+async fn neighborhood(
+    State(app): State<Arc<App>>,
+    Query(p): Query<NeighborhoodParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let seed = app.check(p.id)?;
+    let depth = p.depth.clamp(1, 3);
+    let max_nodes = p.max_nodes.clamp(2, 300);
+
+    let mut picked = vec![seed];
+    let mut seen: std::collections::HashSet<u32> = [seed].into();
+    let mut frontier = vec![seed];
+    for _ in 0..depth {
+        if picked.len() >= max_nodes {
+            break;
+        }
+        // gather candidates one hop out, keep the highest-ranked first
+        let mut candidates: Vec<u32> = Vec::new();
+        for &v in &frontier {
+            for &u in app.g.out(v) {
+                if !seen.contains(&u) {
+                    candidates.push(u);
+                }
+            }
+        }
+        candidates.sort_unstable_by(|&a, &b| app.g.rank(b).total_cmp(&app.g.rank(a)));
+        candidates.dedup();
+        frontier = Vec::new();
+        for u in candidates {
+            if picked.len() >= max_nodes {
+                break;
+            }
+            if seen.insert(u) {
+                picked.push(u);
+                frontier.push(u);
+            }
+        }
+    }
+
+    let set: std::collections::HashSet<u32> = picked.iter().copied().collect();
+    let mut edges = Vec::new();
+    for &from in &picked {
+        for &to in app.g.out(from) {
+            if set.contains(&to) {
+                edges.push([from, to]);
+            }
+        }
+    }
+    let nodes: Vec<Node> = picked.into_iter().map(|v| app.node(v)).collect();
+    Ok(Json(json!({ "nodes": nodes, "edges": edges })))
 }
 
 #[derive(Deserialize)]
