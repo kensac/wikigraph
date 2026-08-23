@@ -165,6 +165,7 @@ pub fn router(app: Arc<App>, tiles_dir: Option<std::path::PathBuf>) -> Router {
         .route("/node/{id}/links", get(links))
         .route("/node/{id}/neighbors.bin", get(neighbors_bin))
         .route("/node/{id}/mesh.bin", get(mesh_bin))
+        .route("/node/{id}/links/search", get(links_search))
         .route("/titles", get(titles))
         .route("/atlas.bin", get(atlas_bin))
         .route("/edges.bin", get(edges_bin))
@@ -353,6 +354,49 @@ async fn atlas_bin(
         ],
         atlas.to_vec(),
     ))
+}
+
+#[derive(Deserialize)]
+struct LinksSearchParams {
+    q: String,
+    #[serde(default)]
+    dir: Dir,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+/// Search within one node's neighbor set (case-insensitive substring over
+/// titles), rank-ordered. Even a 1.6M-link hub is a fast linear scan.
+async fn links_search(
+    State(app): State<Arc<App>>,
+    Path(id): Path<u32>,
+    Query(p): Query<LinksSearchParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let id = app.check(id)?;
+    let needle = p.q.trim().replace(' ', "_").to_lowercase();
+    if needle.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "empty query"));
+    }
+    let limit = p.limit.min(50);
+    let app2 = app.clone();
+    let ids = tokio::task::spawn_blocking(move || {
+        let neighbors = match p.dir {
+            Dir::Out => app2.g.out(id),
+            Dir::In => app2.g.incoming(id),
+        };
+        let mut hits: Vec<u32> = neighbors
+            .iter()
+            .copied()
+            .filter(|&v| app2.g.title(v).to_lowercase().contains(&needle))
+            .collect();
+        hits.sort_by(|&a, &b| app2.g.rank(b).total_cmp(&app2.g.rank(a)));
+        hits.truncate(limit);
+        hits
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "search failed"))?;
+    let items: Vec<Node> = ids.into_iter().map(|v| app.node(v)).collect();
+    Ok(Json(json!({ "items": items })))
 }
 
 #[derive(Deserialize)]
