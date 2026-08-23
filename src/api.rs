@@ -1223,7 +1223,7 @@ fn default_max_par() -> usize {
 async fn game_new(
     State(app): State<Arc<App>>,
     Query(p): Query<GameParams>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
     let (min_par, max_par) = (p.min_par.clamp(2, 8), p.max_par.clamp(2, 8));
     if min_par > max_par {
         return Err(err(StatusCode::BAD_REQUEST, "min_par > max_par"));
