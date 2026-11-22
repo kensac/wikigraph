@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-axum-prometheus = "0.9"
+axum-prometheus = "0.10"
 axum = "0.8"
 flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
 memchr = "2"
